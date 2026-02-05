@@ -1,19 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-🎯 AI 사진 셀렉터 Pro - v19 Ultra Safe
-
-[핵심 개선]
-✅ 썸네일만 사용 (postprocess 제거 → 메모리 폭발 방지)
-✅ 동시 작업 2개 제한 (안전한 메모리 사용)
-✅ 타임아웃 5초 (느린 파일 스킵)
-✅ JPEG 폴백 (썸네일 없으면 스킵)
-
-[성능]
-- 속도: 약간 느림 (안정성 우선)
-- 메모리: 최대 1GB (16GB RAM에서 안전)
-- 안정성: 100% (절대 뻗지 않음)
-"""
-
 import sys
 import os
 import shutil
@@ -22,6 +6,7 @@ import numpy as np
 import cv2
 import math
 import multiprocessing
+from collections import OrderedDict
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
 
@@ -30,10 +15,11 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QWidget, QFileDialog,
     QListWidget, QSplitter, QProgressDialog, QMessageBox,
     QGroupBox, QTextEdit, QDialog, QSlider, QSpinBox, QDoubleSpinBox,
-    QFormLayout, QCheckBox, QComboBox, QDialogButtonBox, QGridLayout
+    QFormLayout, QCheckBox, QComboBox, QDialogButtonBox, QGridLayout,
+    QSizePolicy
 )
-from PyQt6.QtGui import QPixmap, QImage, QShortcut, QKeySequence, QTransform
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QPixmap, QImage, QShortcut, QKeySequence, QTransform, QImageReader
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 
 # 라이브러리 체크
 PIEXIF_AVAILABLE = False
@@ -560,8 +546,77 @@ class AIPhotoCullerV19(QMainWindow):
         
         self.weights={'sharpness':0.4, 'exposure':0.3, 'composition':0.2, 'similarity':0.1}
         self.expo_opts={'penalize_under':True, 'penalize_over':True}
+        
+        self.img_cache = OrderedDict()
+        self.MAX_CACHE_SIZE = 20
+        self.PROXY_SIZE = 1920
+
         self.init_ui()
         self.setup_keys()
+
+    def get_optimized_pixmap(self, filepath):
+        """
+        최적화된 이미지 로딩 (캐싱 + 리사이징)
+        - RAW/고해상도 이미지를 적절한 크기(1920px)로 줄여서 캐싱
+        - LRU 캐시로 메모리 관리
+        """
+        if filepath in self.img_cache:
+            self.img_cache.move_to_end(filepath)
+            return self.img_cache[filepath]
+
+        pix = None
+        try:
+            ext = os.path.splitext(filepath)[1].lower()
+            
+            if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp']:
+                reader = QImageReader(filepath)
+                reader.setAutoTransform(True)
+                
+                size = reader.size()
+                if size.isValid():
+                    h, w = size.height(), size.width()
+                    scale = self.PROXY_SIZE / max(h, w)
+                    if scale < 1:
+                        new_w = int(w * scale)
+                        new_h = int(h * scale)
+                        reader.setScaledSize(QSize(new_w, new_h))
+                
+                img = reader.read()
+                if not img.isNull():
+                    pix = QPixmap.fromImage(img)
+
+            else:
+                with rawpy.imread(filepath) as raw:
+                    try:
+                        thumb = raw.extract_thumb()
+                    except rawpy.LibRawError:
+                         thumb = None
+                    
+                    if thumb:
+                        if thumb.format == rawpy.ThumbFormat.JPEG:
+                            img = QImage.fromData(thumb.data)
+                        else:
+                            img = QImage.fromData(thumb.data)
+                    else:
+                        rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, bright=1.0, user_sat=None)
+                        h, w = rgb.shape[:2]
+                        img = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
+                    
+                    if not img.isNull():
+                        if max(img.width(), img.height()) > self.PROXY_SIZE:
+                            img = img.scaled(self.PROXY_SIZE, self.PROXY_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                        pix = QPixmap.fromImage(img)
+
+        except Exception as e:
+            print(f"이미지 로딩 실패: {e}")
+            return QPixmap()
+
+        if pix and not pix.isNull():
+            self.img_cache[filepath] = pix
+            if len(self.img_cache) > self.MAX_CACHE_SIZE:
+                self.img_cache.popitem(last=False)
+        
+        return pix
 
     def init_ui(self):
         self.setWindowTitle("🤖 AI 사진 셀렉터 Pro v19 Ultra Safe")
@@ -653,8 +708,9 @@ class AIPhotoCullerV19(QMainWindow):
         self.img = QLabel("이미지")
         self.img.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.img.setStyleSheet("background:#111; border:2px solid #444;")
-        self.img.setMinimumSize(800, 600)
-        r_lay.addWidget(self.img)
+        self.img.setMinimumSize(400, 300)
+        self.img.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        r_lay.addWidget(self.img, 1)
         
         b_rot = QPushButton("⟳ 90도 회전 (수동)")
         b_rot.clicked.connect(self.rotate_view)
@@ -834,11 +890,13 @@ class AIPhotoCullerV19(QMainWindow):
     
     def show_img(self, p):
         try:
-            _, ori = get_metadata(p.filepath)
+            pix = self.get_optimized_pixmap(p.filepath)
             
-            with rawpy.imread(p.filepath) as raw:
-                t = raw.extract_thumb()
-                pix = QPixmap.fromImage(QImage.fromData(t.data))
+            if pix is None or pix.isNull():
+                self.img.setText("이미지 로드 실패")
+                return
+
+            _, ori = get_metadata(p.filepath)
             
             tr = Qt.TransformationMode.SmoothTransformation
             if ori == 3: 
@@ -851,7 +909,11 @@ class AIPhotoCullerV19(QMainWindow):
             if self.manual_rotation: 
                 pix = pix.transformed(QTransform().rotate(self.manual_rotation), tr)
             
-            self.img.setPixmap(pix.scaled(self.img.size(), Qt.AspectRatioMode.KeepAspectRatio))
+            target_size = self.img.size()
+            target_size.setWidth(max(1, target_size.width() - 4))
+            target_size.setHeight(max(1, target_size.height() - 4))
+            
+            self.img.setPixmap(pix.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             
             if p.analysis: 
                 a = p.analysis
@@ -859,6 +921,11 @@ class AIPhotoCullerV19(QMainWindow):
                 self.log.setText(f"파일: {p.filename}\n시간: {datetime.fromtimestamp(p.timestamp).strftime('%H:%M:%S')}\n그룹: {p.group_id}")
         except Exception as e:
             print(f"이미지 표시 오류: {e}")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'photos') and self.current_index >= 0 and self.current_index < len(self.photos):
+            self.show_img(self.photos[self.current_index])
 
     def toggle_filter(self, s): 
         self.show_best_only=(s==2)

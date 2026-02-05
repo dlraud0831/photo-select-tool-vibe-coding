@@ -1,0 +1,7 @@
+rawpy
+numpy
+opencv-python
+PyQt6
+piexif
+Pillow
+pyinstaller
